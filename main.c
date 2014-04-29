@@ -1,33 +1,39 @@
 //
-// light multi-bloomfilter server
-// wraps mongoose web-server and a hash-map over the dablooms scalable bloom filter code
+// dablooms_http
+// wraps mongoose web-server and a hash-map over the dablooms scalable bloomfilters, with support for namespacing
 //
 //  main.c
+//
+// Usage:
+// dablooms_http    --folder=<blooms_dir> # -f; no trailing slash
+// Optional :  --port=<port>      # -p; default 9003
+// Optional :  --bootstrap=<file> # -b;
+// Optional :  --test             # -t; turn test mode on
+// Optional :  --daemon           # -d; turn daemon mode on
+// every membership addition is of the form
+// => POST key=foo OR
+// => POST key=foo&ns=mynamespacing
+//
+// every membership query is of the form
+// => GET ?key=foo OR
+// => GET ?key=foo&ns=mynamespacing
+//
+// in which case a seperate scalable bloom filter is maintained for each namespace
+// when no ns is specified, global.bf is used
 //
 //  Created by Bhasker Kode<bosky@helpshift.com> on 27/04/14.
 //  Copyright (c) 2014 HelpShift Inc. All rights reserved.
 //
 
-/**
- * every membership addition is of the form
- * => POST key=foo OR
- * => POST key=foo&ns=mongo.mynamespacing
-
- * every membership query is of the form
- * => GET ?key=foo OR
- * => GET ?key=foo&ns=mongo.mynamespacing
- *
- * in which case a seperate scalable bloom filter is maintained for each namespace
- * when no ns is specified, global.bf is used
- */
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <getopt.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <stdlib.h>
 #include <dirent.h>
 
 #include "mongoose.h"
@@ -36,6 +42,16 @@
 
 #include "constants.h"
 
+// storing command line options
+struct dablooms_http_options {
+    int is_test;
+    int is_daemon;
+    char *port;
+    char *bloom_dir;
+    char *bootstrap;
+} dablooms_http_options = {TEST,DAEMON_ON,PORT_LISTEN,NULL,NULL};
+
+// usage metrics
 struct dablooms_http_metrics {
     int query_hits;
     int query_misses;
@@ -44,14 +60,16 @@ struct dablooms_http_metrics {
     int namespaces;
 } dablooms_http_metrics = {0,0,0,0,0};
 
+// global helper
 struct Server {
     scaling_bloom_t *bloom;
     int i;
     map_t kv;
-    char *bloom_dir;
     struct dablooms_http_metrics metrics;
+    struct dablooms_http_options start_options;
 } Server;
 
+// all hashmap get's or set are of this form
 typedef struct data_struct_s
 {
     char key_string[KEY_MAX_LENGTH];
@@ -60,6 +78,65 @@ typedef struct data_struct_s
 
 
 struct Server server = {.i = 0};
+
+void get_command_line_opts(int argc, char *argv[])
+{
+    int c;
+    int long_index = 0;
+    static struct option longopt[] = {
+        {"folder", required_argument, 0,  'f' },
+        {"port", optional_argument, 0,  'p' },
+        {"test", optional_argument, 0,  't' },
+        {"daemon", optional_argument, 0,  'd' },
+        {"bootstrap", optional_argument, 0,  'b' },
+        {0,0,0,0}
+    };
+    while ((c = getopt_long(argc, argv, "f:p:d:t:b:", longopt, &long_index)) != -1)
+        switch (c)
+    {
+        case 'f':
+            /**
+             * looks in this folder for saved bloom filters
+             * every regular file inside the bloom_dir folder will be loaded back into memory
+             */
+            server.start_options.bloom_dir = realpath (optarg, NULL);
+            printf("\n--folder %s",server.start_options.bloom_dir);
+            break;
+        case 'p':
+            /**
+             * which port to start the web server on
+             */
+            server.start_options.port = optarg;
+            printf("\n--port %s",server.start_options.port);
+            break;
+        case 'd':
+            /**
+             * turn on/off daemon mode
+             */
+            server.start_options.is_daemon = 1;
+            printf("\n--daemon %d",server.start_options.is_daemon);
+            break;
+        case 't':
+            /**
+             * if is test, adds CAPACITY entries for every namespace
+             */
+            server.start_options.is_test = 1;
+            printf("\n--test %d",server.start_options.is_test);
+            break;
+        case 'b':
+            /**
+             * bootstrap all entries in this file into the global namespace
+             */
+            server.start_options.bootstrap = realpath (optarg, NULL);
+            printf("\n--bootstrap %s",server.start_options.bootstrap);
+            break;
+        default:
+            break;
+    }
+    if(!server.start_options.port){
+        server.start_options.port = PORT_LISTEN;
+    }
+}
 
 scaling_bloom_t* reopen_scaling_bloom(const char *bloom_file)
 {
@@ -97,38 +174,38 @@ static void chomp_line(char *word)
 
 scaling_bloom_t* get_scaling_bloom(unsigned int capacity, double error_rate, const char *bloom_file, const char *words_file)
 {
+
     scaling_bloom_t *bloom = new_scaling_bloom(capacity, error_rate, bloom_file);
-    
+
     FILE *fp;
-    
-    if (!(fp = fopen(words_file, "r"))) {
-        fprintf(stderr, "ERROR: Could not open words file\n");
-        return NULL;
-    }
+    if(words_file){
+        if (!(fp = fopen(words_file, "r"))) {
+            fprintf(stderr, "ERROR: Could not open words file %s\n",words_file);
+            return bloom;
+        }
 
-    char word[256];
-    int i,ctr=0;
+        char word[256];
+        int i,ctr=0;
 
-    for (i = 0; fgets(word, sizeof(word), fp); i++,ctr++) {
-        if (i % 2 == 0) {
+        for (i = 0; fgets(word, sizeof(word), fp); i++,ctr++) {
             chomp_line(word);
             scaling_bloom_add(bloom, word, strlen(word), i);
+        
         }
-    }
-
-    if(TEST){
-        printf("\n* test with 1 million words\n");
-        for (i = 0; i < CAPACITY; i++, server.i++) {
-            ctr++;
-            sprintf(word, "word%d", i); // puts string into buffer
-            scaling_bloom_add(bloom, word, strlen(word),i);
+        
+        if(server.start_options.is_test){
+            printf("\n* test with 1 million words\n");
+            for (i = 0; i < CAPACITY; i++, server.i++) {
+                ctr++;
+                sprintf(word, "word%d", i); // puts string into buffer
+                scaling_bloom_add(bloom, word, strlen(word),i);
+            }
         }
+        printf("\nAdded %d words \n",ctr);
+        
+        //fseek(fp, 0, SEEK_SET); // to overwrite file next
+        fclose(fp);
     }
-    printf("Added i=%d ctr=%d words \n",i,ctr);
-    
-    //fseek(fp, 0, SEEK_SET);
-    fclose(fp);
-    
     return bloom;
 }
 
@@ -139,15 +216,15 @@ scaling_bloom_t* get_bloom_for_request(char *ns)
         return server.bloom;
     }else{
         data_struct_t *value;
-        char filename[100];
-        sprintf(filename,"%s%s.bf",server.bloom_dir,ns);
+        char filename[500];
+        sprintf(filename,"%s/%s.bf",server.start_options.bloom_dir,ns);
         error = hashmap_get(server.kv, filename, (void **)(&value));
         if (error==MAP_OK){
             return value->bloom;
         }else{
             value = malloc(sizeof(data_struct_t));
             value->bloom = new_scaling_bloom(CAPACITY, ERROR_RATE, filename);
-            snprintf(value->key_string, KEY_MAX_LENGTH, "%s%s", KEY_PREFIX, filename);
+            snprintf(value->key_string, KEY_MAX_LENGTH, "%s/%s", KEY_PREFIX, filename);
             hashmap_put(server.kv, ns, value);
             server.metrics.namespaces++;
             return value->bloom;
@@ -162,6 +239,8 @@ static int ev_handler(struct mg_connection *conn, enum mg_event ev) {
         char key[500];
         mg_get_var(conn, "key", key, sizeof(key));
         char ns[500];
+        //TODO use uri as ns
+        // sprintf(ns, "%s", conn->uri);
         mg_get_var(conn, "ns", ns, sizeof(ns));
 
         scaling_bloom_t *bloom = get_bloom_for_request(ns);
@@ -204,6 +283,15 @@ static int ev_handler(struct mg_connection *conn, enum mg_event ev) {
     return result;
 }
 
+void show_warning()
+{
+    fprintf(stderr, "Usage:\ndablooms_http    --folder=<blooms_dir> # -f; no trailing slash\n");
+    fprintf(stderr, "     Optional :  --port=<port>      # -p; default 9003\n");
+    fprintf(stderr, "     Optional :  --bootstrap=<file> # -b; \n");
+    fprintf(stderr, "     Optional :  --test             # -t; to turn test mode on\n");
+    fprintf(stderr, "     Optional :  --daemon           # -d; to turn daemon mode on\n");
+}
+
 int start_loop(int argc, char *argv[])
 {
     /**
@@ -212,8 +300,8 @@ int start_loop(int argc, char *argv[])
      * and location of a text file to load by default into the global namespace
      * => ./dablooms /data/blooms/ /tmp/default_words_in_global.txt
      */
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <bloom_dir> <global_bloom_words_file>\n", argv[0]);
+    if (!server.start_options.bloom_dir) {
+        show_warning();
         return EXIT_FAILURE;
     }
 
@@ -223,14 +311,9 @@ int start_loop(int argc, char *argv[])
      */
     server.kv = hashmap_new();
 
-    /**
-     * every regular file inside the bloom_dir folder ( first argument ) will be loaded back into memory
-     */
-    server.bloom_dir = argv[1];
-    
     DIR           *d;
     
-    char * dir_name = server.bloom_dir;
+    char * dir_name = server.start_options.bloom_dir;
     
     /* Open the bloom_dir directory. */
     d = opendir (dir_name);
@@ -248,10 +331,10 @@ int start_loop(int argc, char *argv[])
                 continue;
             if (!strcmp (entry->d_name, "global.bf"))
                 continue;
-            char filename[100];
+            char filename[500];
 
             /* each name here is already named <ns.bf>, convert this to dir/<ns.bf> */
-            sprintf(filename,"%s%s",server.bloom_dir,entry->d_name);
+            sprintf(filename,"%s/%s",server.start_options.bloom_dir,entry->d_name);
             
             /* reference to the bloom filter, which is the value */
             scaling_bloom_t *bloom = reopen_scaling_bloom(filename);
@@ -261,7 +344,7 @@ int start_loop(int argc, char *argv[])
             /* reference to the key */
             data_struct_t *value = malloc(sizeof(data_struct_t));
             value->bloom = bloom;
-            snprintf(value->key_string, KEY_MAX_LENGTH, "%s%s", KEY_PREFIX, filename);
+            snprintf(value->key_string, KEY_MAX_LENGTH, "%s/%s", KEY_PREFIX, filename);
   
             /* set it into the hashmap */
             hashmap_put(server.kv, filename, value);
@@ -275,34 +358,39 @@ int start_loop(int argc, char *argv[])
         }
     }
     
-    /* load the global bloom filter */
     char global_bloom[100];
-    sprintf(global_bloom, "%sglobal.bf",server.bloom_dir);
-    char bootstrap_global_bf_file[100];
-    sprintf(bootstrap_global_bf_file, "%s", argv[2]);
-    server.bloom = get_scaling_bloom(CAPACITY, ERROR_RATE, global_bloom, bootstrap_global_bf_file);
+    sprintf(global_bloom, "%s/global.bf",server.start_options.bloom_dir);
+    if(server.start_options.bootstrap){
+        /* load the global bloom filter */
+        char bootstrap_global_bf_file[500];
+        sprintf(bootstrap_global_bf_file, "%s", server.start_options.bootstrap);
+        server.bloom = get_scaling_bloom(CAPACITY, ERROR_RATE, global_bloom, bootstrap_global_bf_file);
+    }else{
+        server.bloom = get_scaling_bloom(CAPACITY, ERROR_RATE, global_bloom, NULL);
+    }
     server.metrics.namespaces++;
     
     if (!server.bloom) {
+        show_warning();
         return EXIT_FAILURE;
     }else{
         /**
          * web server
          */
 
-        struct mg_server *server;
+        struct mg_server *http_server;
         
         /* Create and configure the server */
-        server = mg_create_server(NULL, ev_handler);
-        mg_set_option(server, "listening_port", PORT_LISTEN);
+        http_server = mg_create_server(NULL, ev_handler);
+        mg_set_option(http_server, "listening_port", server.start_options.port);
         
-        printf("Starting on port %s\n", mg_get_option(server, "listening_port"));
+        printf("\nStarting on port %s\n", mg_get_option(http_server, "listening_port"));
         for (;;) {
-            mg_poll_server(server, 1000);
+            mg_poll_server(http_server, 1000);
         }
         
         /* Cleanup, and free server instance */
-        mg_destroy_server(&server);
+        mg_destroy_server(&http_server);
         
         return 0;
     }
@@ -310,14 +398,14 @@ int start_loop(int argc, char *argv[])
 
 int main(int argc, char *argv[])
 {
-    
+    get_command_line_opts(argc, argv);
     int pid;
-    if(DAEMON_ON){
+    if(server.start_options.is_daemon){
         
         pid=fork();  /* Duplicate. Child and parent continue from here.*/
         if (pid!=0)  /* pid is non-zero, so I must be the parent  */
         {
-            printf("dablooms started as daemon with PID %d.\n", pid);
+            printf("\ndablooms_http started as daemon with PID %d.\n", pid);
             return 0;
         }
         else  /* pid is zero, so I must be the child. */
